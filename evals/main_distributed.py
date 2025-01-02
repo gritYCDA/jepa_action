@@ -16,15 +16,25 @@ import yaml
 import submitit
 
 from evals.scaffold import main as eval_main
+from evals.config_utils import load_config
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 parser = argparse.ArgumentParser()
+# parser.add_argument(
+#     '--folder', type=str,
+#     help='location to save submitit logs',
+#     default='/fsx-jepa/massran/submitit/')
+# parser.add_argument(
+#     '--folder', type=str,
+#     help='location to save submitit logs',
+#     default='/mnt/jaden/jepa/submitit_logs/')  # 클라우드 스토리지 경로
 parser.add_argument(
     '--folder', type=str,
     help='location to save submitit logs',
-    default='/fsx-jepa/massran/submitit/')
+    default='./logs/submitit/')  # 프로젝트 루트 기준 상대 경로
+
 parser.add_argument(
     '--exclude', type=str,
     help='nodes to exclude from training',
@@ -42,6 +52,13 @@ parser.add_argument(
 parser.add_argument(
     '--time', type=int, default=4300,
     help='time in minutes to run job')
+parser.add_argument(
+    '--env', type=str, choices=['local', 'azure'], default='azure', 
+    help='environment to run in (local or azure)')
+parser.add_argument(
+    '--tag', type=str,
+    help='override tag in config file',
+    default=None)
 
 
 class Trainer:
@@ -135,7 +152,14 @@ def launch_evals():
     configs = []
     for f in config_fnames:
         with open(f, 'r') as y_file:
-            _params = yaml.load(y_file, Loader=yaml.FullLoader)
+            # _params = yaml.load(y_file, Loader=yaml.FullLoader)
+            # config_utils를 사용하여 환경별 설정 로드
+            _params = load_config(f, args.env)
+            # tag override if provided
+            if args.tag is not None:
+                _params['tag'] = args.tag
+                logger.info(f'Overriding tag with: {args.tag}')
+
             nodes = int(_params.get('nodes'))
             tasks_per_node = int(_params.get('tasks_per_node'))
             configs += [_params]

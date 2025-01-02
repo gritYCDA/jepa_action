@@ -103,7 +103,11 @@ class AttentivePooler(nn.Module):
 
 
 class AttentiveClassifier(nn.Module):
-    """ Attentive Classifier """
+    """ Attentive Classifier 
+
+        x = [B, segment*T*N, D][8, 8192, 768]
+
+    """
     def __init__(
         self,
         embed_dim=768,
@@ -131,6 +135,7 @@ class AttentiveClassifier(nn.Module):
         self.linear = nn.Linear(embed_dim, num_classes, bias=True)
 
     def forward(self, x):
+        # import pdb;pdb.set_trace()
         x = self.pooler(x).squeeze(1)
         x = self.linear(x)
         return x

@@ -15,6 +15,7 @@ import yaml
 from src.utils.distributed import init_distributed
 
 from evals.scaffold import main as eval_main
+from evals.config_utils import load_config
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -24,9 +25,12 @@ parser.add_argument(
 parser.add_argument(
     '--devices', type=str, nargs='+', default=['cuda:0'],
     help='which devices to use on local machine')
+parser.add_argument(
+    '--env', type=str, choices=['local', 'azure'], default='local',  
+    help='environment to run in (local or azure)')
 
 
-def process_main(rank, fname, world_size, devices):
+def process_main(rank, fname, world_size, devices, env):
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = str(devices[rank].split(':')[-1])
 
@@ -38,15 +42,13 @@ def process_main(rank, fname, world_size, devices):
     else:
         logger.setLevel(logging.ERROR)
 
-    logger.info(f'called-params {fname}')
+    logger.info(f'called-params {fname} with env {env}')
 
-    # Load config
-    params = None
-    with open(fname, 'r') as y_file:
-        params = yaml.load(y_file, Loader=yaml.FullLoader)
-        logger.info('loaded params...')
-        pp = pprint.PrettyPrinter(indent=4)
-        pp.pprint(params)
+    # config_utils를 사용하여 환경별 설정 로드
+    params = load_config(fname, env)
+    logger.info('loaded params...')
+    pp = pprint.PrettyPrinter(indent=4)
+    pp.pprint(params)
 
     # Init distributed (access to comm between GPUS on same machine)
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
@@ -63,5 +65,5 @@ if __name__ == '__main__':
     for rank in range(num_gpus):
         mp.Process(
             target=process_main,
-            args=(rank, args.fname, num_gpus, args.devices)
+            args=(rank, args.fname, num_gpus, args.devices, args.env)
         ).start()

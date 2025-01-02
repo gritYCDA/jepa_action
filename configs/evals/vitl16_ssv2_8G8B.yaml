@@ -1,0 +1,58 @@
+# nodes: 1  # 8 nodes -> 1 node
+# tasks_per_node: 4
+tag: jepa_8G_8B_2-5e4
+exp_name: jepa_reproducing
+eval_name: video_classification_frozen
+resume_checkpoint: false
+# 환경별 경로 설정
+env_paths:
+  local:
+    dataset_train: /datasets/sthv2/local_train.csv
+    dataset_val: /datasets/sthv2/local_val.csv
+    pretrain_folder: /storage/igor_encoder/checkpoint/
+    save_folder: /datadisk/jepa/work_dirs/
+  azure:
+    dataset_train: /mnt/jaden/datasets/sthv2/azure_train.csv
+    dataset_val: /mnt/jaden/datasets/sthv2/azure_val.csv
+    pretrain_folder: /mnt/jaden/igor_encoder/checkpoint/
+    save_folder: /mnt/jaden/jepa_work_dirs/
+save_folder: ${env:save_folder}
+data:
+  dataset_train: ${env:dataset_train}
+  dataset_val: ${env:dataset_val}
+  dataset_type: VideoDataset
+  num_classes: 174
+  frames_per_clip: 16
+  num_segments: 2
+  num_views_per_segment: 3
+  frame_step: 4
+optimization:
+  attend_across_segments: true
+  num_epochs: 20  # (20 → 25)
+  resolution: 224
+  batch_size: 8  # (4 → 8)    256 (8 nodes * 8 GPUs * 4 batch) -> 64 (1 node * 8 GPUs * 8 batch)
+  weight_decay: 0.01
+  lr: 0.00025 # 0.001 * (64/256) = 0.00025
+  start_lr: 0.00025 # 0.001 * (64/256) = 0.00025
+  final_lr: 0.0
+  warmup: 0. # (0. → 0.1)
+  use_bfloat16: true
+pretrain:
+  model_name: vit_large
+  checkpoint_key: target_encoder
+  clip_duration: null
+  frames_per_clip: 16
+  tubelet_size: 2
+  uniform_power: true
+  use_silu: false
+  tight_silu: false
+  use_sdpa: true
+  patch_size: 16
+  folder: ${env:pretrain_folder}
+  checkpoint: vitl16.pth.tar  # name of pretrained model file inside folder
+  write_tag: jepa
+
+
+
+# amlt project create setting_jepa rushaml2996082614 jaden test
+# amlt workspace add RushAML --resource-group SouthCentralUS --subscription 1584df91-d540-4cd3-a9ca-24ff3dc95ba7

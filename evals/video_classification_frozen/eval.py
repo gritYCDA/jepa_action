@@ -6,6 +6,11 @@
 #
 
 import os
+import wandb
+os.environ['WANDB_API_KEY'] = '3f7b0e5db495d33d26adf24bd4f075c6b1c0cbe3'
+
+# usecase:    DEBUG_ITERS=10 python train.py
+DEBUG_ITERS = os.environ.get('DEBUG_ITERS', None)
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -27,7 +32,9 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from torch.nn.parallel import DistributedDataParallel
+import torch.distributed as dist
 
+from src.models.igor import IGORWrapper
 import src.models.vision_transformer as vit
 from src.models.attentive_pooler import AttentiveClassifier
 from src.datasets.data_manager import (
@@ -52,9 +59,9 @@ from evals.video_classification_frozen.utils import (
     FrameAggregation
 )
 
-logging.basicConfig()
+# logging.basicConfig()
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO)
 
 _GLOBAL_SEED = 0
 np.random.seed(_GLOBAL_SEED)
@@ -86,6 +93,8 @@ def main(args_eval, resume_preempt=False):
     # Optional [for Video model]:
     tubelet_size = args_pretrain.get('tubelet_size', 2)
     pretrain_frames_per_clip = args_pretrain.get('frames_per_clip', 1)
+    # Optional [IGOR ablations]:
+    freeze_all = args_pretrain.get('freeze_all', True)
 
     # -- DATA
     args_data = args_eval.get('data')
@@ -115,6 +124,8 @@ def main(args_eval, resume_preempt=False):
     # -- EXPERIMENT-ID/TAG (optional)
     resume_checkpoint = args_eval.get('resume_checkpoint', False) or resume_preempt
     eval_tag = args_eval.get('tag', None)
+    exp_name = args_eval.get('exp_name', None)
+    save_folder = args_eval.get('save_folder', None)
 
     # ----------------------------------------------------------------------- #
 
@@ -126,27 +137,69 @@ def main(args_eval, resume_preempt=False):
     if not torch.cuda.is_available():
         device = torch.device('cpu')
     else:
-        device = torch.device('cuda:0')
-        torch.cuda.set_device(device)
+        local_rank = dist.get_rank()
+        device = torch.device(f'cuda:{local_rank}')
+        torch.cuda.set_device(local_rank)
 
     world_size, rank = init_distributed()
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
 
+    # -- Check if in debug mode
+    debug_mode = os.environ.get('DEBUG_ITERS') is not None
+    # -- Create timestamp for the experiment
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
     # -- log/checkpointing paths
-    folder = os.path.join(pretrain_folder, 'video_classification_frozen/')
+    if eval_tag in ["test", "TEST"]:
+        exp_name = "jepa_testing"
+    folder = os.path.join(save_folder, exp_name)
     if eval_tag is not None:
         folder = os.path.join(folder, eval_tag)
+
+    # Add DEBUG suffix if in debug mode, otherwise add timestamp
+    if debug_mode:
+        folder = os.path.join(folder, 'DEBUG')
+    else:
+        folder = os.path.join(folder, timestamp)
+
     if not os.path.exists(folder):
         os.makedirs(folder, exist_ok=True)
     log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
     latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
+    best_path = os.path.join(folder, f'{tag}-best.pth.tar')
 
     # -- make csv_logger
     if rank == 0:
         csv_logger = CSVLogger(log_file,
-                               ('%d', 'epoch'),
-                               ('%.5f', 'loss'),
-                               ('%.5f', 'acc'))
+                                ('%d', 'epoch'),
+                                ('%.5f', 'train_top1'),
+                                ('%.5f', 'train_top5'),
+                                ('%.5f', 'train_loss'),
+                                ('%.5f', 'val_top1'),
+                                ('%.5f', 'val_top5'),
+                                ('%.5f', 'val_loss'))
+        # WandB 초기화 (rank 0인 프로세스만 실행)
+        wandb.init(
+            id=None,  # None으로 설정하면 매번 새로운 run ID가 생성됨
+            resume=False,  # 이전 실행을 재개하지 않음
+            project=exp_name,
+            entity="prj_msra",
+            config={
+                "model_name": model_name,
+                "batch_size": batch_size,
+                "start_lr": start_lr,
+                "lr": lr,
+                "final_lr": final_lr,
+                "weight_decay": wd,
+                "num_epochs": num_epochs,
+                "resolution": resolution,
+                "num_segments": eval_num_segments,
+                "frames_per_clip": eval_frames_per_clip,
+                "frame_step": eval_frame_step,
+            },
+            name=eval_tag if eval_tag else "your_eval_tag",
+        )
 
     # Initialize model
 
@@ -163,20 +216,40 @@ def main(args_eval, resume_preempt=False):
         checkpoint_key=checkpoint_key,
         use_SiLU=use_SiLU,
         tight_SiLU=tight_SiLU,
-        use_sdpa=use_sdpa)
-    if pretrain_frames_per_clip == 1:
-        # Process each frame independently and aggregate
-        encoder = FrameAggregation(encoder).to(device)
+        use_sdpa=use_sdpa,
+        attend_across_segments=attend_across_segments)
+    
+    if model_name.startswith('igor'):
+    # Case of IGOR
+        encoder = encoder.to(device)
+        if freeze_all:  # 새로운 flag 추가 필요
+            encoder.freeze_all()  # DINOv2와 ST-Transformer 모두 freeze
+        else:
+            # DINOv2는 항상 frozen
+            # encoder.igor.dino_encoder.freeze()
+            encoder.igor.dino_encoder.eval()  
+            for p in encoder.igor.dino_encoder.parameters():
+                p.requires_grad = False
+            
+            # ST-Transformer는 trainable하게 설정 가능
+            encoder.unfreeze_st_transformer()
+
     else:
-        # Process each video clip independently and aggregate
-        encoder = ClipAggregation(
-            encoder,
-            tubelet_size=tubelet_size,
-            attend_across_segments=attend_across_segments
-        ).to(device)
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
+    # Case of JEPA
+        if pretrain_frames_per_clip == 1:
+            # Process each frame independently and aggregate
+            encoder = FrameAggregation(encoder).to(device)
+        else:
+            # Process each video clip independently and aggregate
+            encoder = ClipAggregation(
+                encoder,
+                tubelet_size=tubelet_size,
+                attend_across_segments=attend_across_segments
+            ).to(device)
+
+        encoder.eval()
+        for p in encoder.parameters():
+            p.requires_grad = False
 
     # -- init classifier
     classifier = AttentiveClassifier(
@@ -185,6 +258,7 @@ def main(args_eval, resume_preempt=False):
         depth=1,
         num_classes=num_classes,
     ).to(device)
+    print(classifier)
 
     train_loader = make_dataloader(
         dataset_type=dataset_type,
@@ -228,10 +302,19 @@ def main(args_eval, resume_preempt=False):
         warmup=warmup,
         num_epochs=num_epochs,
         use_bfloat16=use_bfloat16)
-    classifier = DistributedDataParallel(classifier, static_graph=True)
+    local_rank = dist.get_rank()
+    classifier = DistributedDataParallel(
+        classifier,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        static_graph=True
+    )
 
     # -- load training checkpoint
     start_epoch = 0
+    # best accuracy 추적을 위한 변수 추가
+    best_acc = 0.0
+
     if resume_checkpoint:
         classifier, optimizer, scaler, start_epoch = load_checkpoint(
             device=device,
@@ -243,7 +326,7 @@ def main(args_eval, resume_preempt=False):
             scheduler.step()
             wd_scheduler.step()
 
-    def save_checkpoint(epoch):
+    def save_checkpoint(epoch, is_best=False):
         save_dict = {
             'classifier': classifier.state_dict(),
             'opt': optimizer.state_dict(),
@@ -251,15 +334,21 @@ def main(args_eval, resume_preempt=False):
             'epoch': epoch,
             'batch_size': batch_size,
             'world_size': world_size,
-            'lr': lr
+            'lr': lr,
+            'best_acc': best_acc  # best accuracy 정보 추가
         }
         if rank == 0:
+            # latest 체크포인트 저장
             torch.save(save_dict, latest_path)
+            # best 모델일 경우 복사
+            if is_best:
+                logger.info(f'[Epoch {epoch:d}] New best model with accuracy: {best_acc:.2f}%')
+                torch.save(save_dict, best_path)
 
     # TRAIN LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info('Epoch %d' % (epoch + 1))
-        train_acc = run_one_epoch(
+        train_metrics = run_one_epoch(
             device=device,
             training=True,
             num_temporal_views=eval_num_segments if attend_across_segments else 1,
@@ -272,9 +361,11 @@ def main(args_eval, resume_preempt=False):
             scheduler=scheduler,
             wd_scheduler=wd_scheduler,
             data_loader=train_loader,
-            use_bfloat16=use_bfloat16)
+            use_bfloat16=use_bfloat16,
+            num_epochs=num_epochs,
+            epoch=epoch)
 
-        val_acc = run_one_epoch(
+        val_metrics = run_one_epoch(
             device=device,
             training=False,
             num_temporal_views=eval_num_segments,
@@ -287,12 +378,37 @@ def main(args_eval, resume_preempt=False):
             scheduler=scheduler,
             wd_scheduler=wd_scheduler,
             data_loader=val_loader,
-            use_bfloat16=use_bfloat16)
+            use_bfloat16=use_bfloat16,
+            num_epochs=num_epochs,
+            epoch=epoch)
 
-        logger.info('[%5d] train: %.3f%% test: %.3f%%' % (epoch + 1, train_acc, val_acc))
-        if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
-        save_checkpoint(epoch + 1)
+        if dist.get_rank() == 0:
+            logger.info('[%5d] [ train: %.3f%% / %.3f%% (loss: %.3f)]  [ test: %.3f%% / %.3f%% (loss: %.3f)]' % 
+                    (epoch + 1, 
+                        train_metrics['top1_acc'], train_metrics['top5_acc'], train_metrics['loss'],
+                        val_metrics['top1_acc'], val_metrics['top5_acc'], val_metrics['loss']))
+
+            csv_logger.log(epoch + 1, 
+                          train_metrics['top1_acc'], train_metrics['top5_acc'], train_metrics['loss'],
+                          val_metrics['top1_acc'], val_metrics['top5_acc'], val_metrics['loss'])
+            wandb.log({
+                "opt/epoch": epoch + 1,
+                "train/epoch_loss": train_metrics['loss'],
+                "train/epoch_accuracy_top1": train_metrics['top1_acc'],
+                "train/epoch_accuracy_top5": train_metrics['top5_acc'],
+                "val/epoch_loss": val_metrics['loss'],
+                "val/epoch_accuracy_top1": val_metrics['top1_acc'],
+                "val/epoch_accuracy_top5": val_metrics['top5_acc'],
+                "opt/learning_rate": scheduler.get_last_lr()[0],
+                "opt/weight_decay": wd_scheduler.get_last_wd(),
+            })
+        
+        # best 모델 체크 및 저장
+        is_best = val_metrics['top1_acc'] > best_acc
+        if is_best:
+            best_acc = val_metrics['top1_acc']
+
+        save_checkpoint(epoch + 1, is_best)
 
 
 def run_one_epoch(
@@ -309,12 +425,22 @@ def run_one_epoch(
     num_spatial_views,
     num_temporal_views,
     attend_across_segments,
+    num_epochs,
+    epoch,
 ):
 
     classifier.train(mode=training)
     criterion = torch.nn.CrossEntropyLoss()
     top1_meter = AverageMeter()
+    top5_meter = AverageMeter()
+    loss_meter = AverageMeter()
+
+    # 데이터로더 전체 길이
+    total_iters = len(data_loader)
+
     for itr, data in enumerate(data_loader):
+        if DEBUG_ITERS and itr >= int(DEBUG_ITERS):
+            break
 
         if training:
             scheduler.step()
@@ -331,9 +457,29 @@ def run_one_epoch(
             labels = data[1].to(device)
             batch_size = len(labels)
 
+            # Feature extraction logging
+            # print(f"\n=== Feature Extraction Check (iter {itr}) ===")
+            # print(f"Model type: {'IGOR' if isinstance(encoder, IGORWrapper) else 'JEPA'}")
+
             # Forward and prediction
-            with torch.no_grad():
+            with torch.no_grad(): #TODO: In the unfreeze 모드에서 bug!!!!!!
                 outputs = encoder(clips, clip_indices)
+                # # Check outputs format and statistics
+                # if isinstance(outputs, list):
+                #     print(f"\nNumber of views: {len(outputs)}")
+                #     for i, view_output in enumerate(outputs):
+                #         if isinstance(view_output, list):  # attend_across_segments=False
+                #             print(f"\nView {i} segments:")
+                #             for j, segment in enumerate(view_output):
+                #                 print(f"  Segment {j} - shape: {segment.shape}")
+                #                 print(f"              range: [{segment.min():.4f}, {segment.max():.4f}]")
+                #                 print(f"              mean/std: {segment.mean():.4f}/{segment.std():.4f}")
+                #         else:  # attend_across_segments=True
+                #             print(f"\nView {i} - shape: {view_output.shape}")
+                #             print(f"         range: [{view_output.min():.4f}, {view_output.max():.4f}]")
+                #             print(f"         mean/std: {view_output.mean():.4f}/{view_output.std():.4f}")
+                # print("================================")
+                
                 if not training:
                     if attend_across_segments:
                         outputs = [classifier(o) for o in outputs]
@@ -358,6 +504,18 @@ def run_one_epoch(
             top1_acc = 100. * outputs.max(dim=1).indices.eq(labels).sum() / batch_size
             top1_acc = float(AllReduce.apply(top1_acc))
             top1_meter.update(top1_acc)
+            
+            # Top-5 Accuracy
+            _, top5_preds = outputs.topk(5, dim=1)
+            top5_correct = top5_preds.eq(labels.view(-1, 1).expand_as(top5_preds)).sum()
+            top5_acc = 100. * top5_correct / batch_size  # float 변환하지 않음
+            top5_acc = torch.tensor(top5_acc).cuda()     # GPU 텐서로 변환
+            top5_acc = AllReduce.apply(top5_acc)         # AllReduce 적용
+            top5_acc = float(top5_acc)                   # 최종 결과를 float로 변환
+            top5_meter.update(top5_acc)
+            
+            # Loss tracking
+            loss_meter.update(loss.item())
 
         if training:
             if use_bfloat16:
@@ -372,13 +530,34 @@ def run_one_epoch(
                 optimizer.step()
             optimizer.zero_grad()
 
-        if itr % 20 == 0:
-            logger.info('[%5d] %.3f%% (loss: %.3f) [mem: %.2e]'
-                        % (itr, top1_meter.avg, loss,
-                           torch.cuda.max_memory_allocated() / 1024.**2))
+        # WandB 로깅 (rank 0만, 20 iteration마다)
+        if itr % 20 == 0 and dist.get_rank() == 0:
+            # 기본 로깅 데이터
+            log_data = {
+                f"{'train' if training else 'val'}/avg_loss": loss_meter.avg,
+                f"{'train' if training else 'val'}/avg_accuracy_top1": top1_meter.avg,
+                f"{'train' if training else 'val'}/avg_accuracy_top5": top5_meter.avg,
+            }
+            # training 모드일 때만 progress와 system 정보 기록
+            if training:
+                log_data.update({
+                    "system/gpu_memory_gb": torch.cuda.max_memory_allocated() / 1024.**3,
+                    "opt/epoch": epoch + 1,
+                    "opt/progress": (epoch * total_iters + itr) / (num_epochs * total_iters),
+                })
+            wandb.log(log_data)
 
-    return top1_meter.avg
+            logger.info('%5d epoch [%5d / %5d]   top1: %.3f%%   top5: %.3f%% (loss: %.3f) [mem: %.2e] -- progress: %.3f%%'
+                        % (epoch+1, itr, total_iters, top1_meter.avg, top5_meter.avg, loss_meter.avg,
+                           torch.cuda.max_memory_allocated() / 1024.**2,
+                           (epoch * total_iters + itr) / (num_epochs * total_iters) * 100)
+                           )
 
+    return {
+        'top1_acc': top1_meter.avg,
+        'top5_acc': top5_meter.avg,
+        'loss': loss_meter.avg
+    }
 
 def load_checkpoint(
     device,
@@ -416,28 +595,132 @@ def load_pretrained(
     pretrained,
     checkpoint_key='target_encoder'
 ):
-    logger.info(f'Loading pretrained model from {pretrained}')
-    checkpoint = torch.load(pretrained, map_location='cpu')
-    try:
-        pretrained_dict = checkpoint[checkpoint_key]
-    except Exception:
-        pretrained_dict = checkpoint['encoder']
 
-    pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
-    pretrained_dict = {k.replace('backbone.', ''): v for k, v in pretrained_dict.items()}
-    for k, v in encoder.state_dict().items():
-        if k not in pretrained_dict:
-            logger.info(f'key "{k}" could not be found in loaded state dict')
-        elif pretrained_dict[k].shape != v.shape:
-            logger.info(f'key "{k}" is of different shape in model and loaded state dict')
-            pretrained_dict[k] = v
-    msg = encoder.load_state_dict(pretrained_dict, strict=False)
+    logger.info(f'Loading pretrained model from {pretrained}')
+
+    if isinstance(encoder, IGORWrapper):
+        # IGOR
+        checkpoint = torch.load(pretrained, map_location='cpu')
+
+        # Checkpoint 구조 확인
+        logger.info("\n=== Weight Loading Check ===")
+        logger.info(f"Available keys in pretrained weights:")
+        for k in checkpoint.keys():
+            logger.info(f"- {k}")
+
+        # checkpoint의 모든 key가 'igor_encoder.'로 시작하는 것을 확인
+        # 직접 state_dict를 구성
+        pretrained_dict = {}
+        for k, v in checkpoint.items():
+            if k.startswith('igor_encoder.'):
+                # igor_encoder. prefix 제거
+                new_k = k[len('igor_encoder.'):]
+                pretrained_dict[new_k] = v
+
+        # logger.info("Available keys in pretrained weights:")
+        # for k in pretrained_dict.keys():
+        #     logger.info(f"- {k}")
+
+        # Weight loading 결과 확인
+        msg = encoder.igor.load_state_dict(pretrained_dict, strict=False)
+        logger.info(f'Loaded pretrained weights with msg: {msg}')
+        logger.info(f'Missing keys: {msg.missing_keys}')
+        logger.info(f'Unexpected keys: {msg.unexpected_keys}')
+
+        # # 주요 layer들의 weight statistics 확인
+        # logger.info("\nWeight Statistics Check:")
+        # for name, param in encoder.igor.named_parameters():
+        #     if param.requires_grad:  # trainable parameters만
+        #         logger.info(f"{name}:")
+        #         logger.info(f"  shape: {param.shape}")
+        #         logger.info(f"  mean/std: {param.mean():.4f}/{param.std():.4f}")
+        #         logger.info(f"  range: [{param.min():.4f}, {param.max():.4f}]")
+        # logger.info("===========================")
+
+        del checkpoint
+
+    else:
+        # 기존 ViT 모델 로딩 로직 유지
+        checkpoint = torch.load(pretrained, map_location='cpu')
+        try:
+            pretrained_dict = checkpoint[checkpoint_key]
+        except Exception:
+            pretrained_dict = checkpoint['encoder']
+
+        pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace('backbone.', ''): v for k, v in pretrained_dict.items()}
+        for k, v in encoder.state_dict().items():
+            if k not in pretrained_dict:
+                logger.info(f'key "{k}" could not be found in loaded state dict')
+            elif pretrained_dict[k].shape != v.shape:
+                logger.info(f'key "{k}" is of different shape in model and loaded state dict')
+                pretrained_dict[k] = v
+        msg = encoder.load_state_dict(pretrained_dict, strict=False)
+        print(encoder)
+        logger.info(f'loaded pretrained model with msg: {msg}')
+        logger.info(f'loaded pretrained encoder from epoch: {checkpoint["epoch"]}\n path: {pretrained}')
+        del checkpoint
+
     print(encoder)
-    logger.info(f'loaded pretrained model with msg: {msg}')
-    logger.info(f'loaded pretrained encoder from epoch: {checkpoint["epoch"]}\n path: {pretrained}')
-    del checkpoint
     return encoder
 
+
+def load_pretrained_(
+    encoder,
+    pretrained,
+    checkpoint_key='target_encoder'
+):
+    logger.info(f'Loading pretrained model from {pretrained}')
+    checkpoint = torch.load(pretrained, map_location='cpu')
+
+    # # 체크포인트 구조 확인을 위한 로깅 추가
+    # logger.info("Available keys in checkpoint:")
+    # for k in checkpoint.keys():
+    #     logger.info(f"- {k}")
+
+    if isinstance(encoder, IGORWrapper):
+        # IGOR의 경우 
+        try:
+            # checkpoint key 시도
+            if checkpoint_key in checkpoint:
+                pretrained_dict = checkpoint[checkpoint_key]
+            elif 'state_dict' in checkpoint:  # mmaction2 형식 체크
+                pretrained_dict = checkpoint['state_dict']
+            else:
+                # 사용 가능한 첫 번째 key 사용
+                first_key = list(checkpoint.keys())[0]
+                logger.info(f"Using first available key: {first_key}")
+                pretrained_dict = checkpoint[first_key]
+
+            # 가중치 구조 로깅
+            logger.info("Available keys in pretrained weights:")
+            for k in pretrained_dict.keys():
+                logger.info(f"- {k}")
+
+            msg = encoder.igor.load_state_dict(pretrained_dict, strict=False)
+            logger.info(f'Loaded pretrained weights with msg: {msg}')
+            logger.info(f'Missing keys: {msg.missing_keys}')
+            logger.info(f'Unexpected keys: {msg.unexpected_keys}')
+
+        except Exception as e:
+            logger.error(f"Error loading checkpoint: {e}")
+            raise e
+    else:
+        # 기존 ViT 모델 로딩 로직
+        try:
+            pretrained_dict = checkpoint[checkpoint_key]
+        except Exception:
+            pretrained_dict = checkpoint['encoder']
+            
+        pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
+        pretrained_dict = {k.replace('backbone.', ''): v for k, v in pretrained_dict.items()}
+        msg = encoder.load_state_dict(pretrained_dict, strict=False)
+
+    if 'epoch' in checkpoint:
+        logger.info(f'Loaded from epoch: {checkpoint["epoch"]}\n path: {pretrained}')
+    
+    print(encoder)
+    return encoder
 
 def make_dataloader(
     root_path,
@@ -501,21 +784,36 @@ def init_model(
     use_SiLU=False,
     tight_SiLU=True,
     uniform_power=False,
-    checkpoint_key='target_encoder'
+    checkpoint_key='target_encoder',
+    attend_across_segments=True
 ):
-    encoder = vit.__dict__[model_name](
-        img_size=crop_size,
-        patch_size=patch_size,
-        num_frames=frames_per_clip,
-        tubelet_size=tubelet_size,
-        uniform_power=uniform_power,
-        use_sdpa=use_sdpa,
-        use_SiLU=use_SiLU,
-        tight_SiLU=tight_SiLU,
-    )
-
-    encoder.to(device)
-    encoder = load_pretrained(encoder=encoder, pretrained=pretrained, checkpoint_key=checkpoint_key)
+    if model_name.startswith('igor'):
+        # IGOR 모델 초기화
+        encoder = IGORWrapper(
+            d_t=8,  # IGOR의 기본 temporal window 크기
+            encoder_depth=10,
+            encoder_embed_dim=768,
+            encoder_n_heads=12,
+            pretrained_dino_size='base',
+            use_flash_attn=True,
+            attend_across_segments=attend_across_segments
+        )
+        encoder.to(device)
+        encoder = load_pretrained(encoder=encoder, pretrained=pretrained, checkpoint_key=checkpoint_key)
+    else:
+        # 기존 ViT 모델 초기화
+        encoder = vit.__dict__[model_name](
+            img_size=crop_size,
+            patch_size=patch_size,
+            num_frames=frames_per_clip,
+            tubelet_size=tubelet_size,
+            uniform_power=uniform_power,
+            use_sdpa=use_sdpa,
+            use_SiLU=use_SiLU,
+            tight_SiLU=tight_SiLU,
+        )
+        encoder.to(device)
+        encoder = load_pretrained(encoder=encoder, pretrained=pretrained, checkpoint_key=checkpoint_key)
     return encoder
 
 

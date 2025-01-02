@@ -27,6 +27,7 @@ class WarmupCosineSchedule(object):
         self.warmup_steps = warmup_steps
         self.T_max = T_max - warmup_steps
         self._step = 0.
+        self.current_lr = start_lr  # 현재 lr을 추적하기 위해 추가
 
     def step(self):
         self._step += 1
@@ -42,8 +43,13 @@ class WarmupCosineSchedule(object):
         for group in self.optimizer.param_groups:
             group['lr'] = new_lr
 
+        self.current_lr = new_lr    # 현재 lr을 추적하기 위해 추가
+
         return new_lr
 
+    def get_last_lr(self):
+        """PyTorch 스케줄러와 호환되는 get_last_lr 메소드"""
+        return [self.current_lr]  # 모든 파라미터 그룹이 같은 lr을 사용하므로 단일 값의 리스트 반환
 
 class CosineWDSchedule(object):
 
@@ -59,6 +65,8 @@ class CosineWDSchedule(object):
         self.final_wd = final_wd
         self.T_max = T_max
         self._step = 0.
+        self.current_wd = ref_wd  # 현재 weight decay 값을 추적하기 위해 추가
+
 
     def step(self):
         self._step += 1
@@ -73,4 +81,10 @@ class CosineWDSchedule(object):
         for group in self.optimizer.param_groups:
             if ('WD_exclude' not in group) or not group['WD_exclude']:
                 group['weight_decay'] = new_wd
+
+        self.current_wd = new_wd  # 현재 weight decay 값 업데이트
         return new_wd
+
+    def get_last_wd(self):
+        """현재 weight decay 값 반환"""
+        return self.current_wd

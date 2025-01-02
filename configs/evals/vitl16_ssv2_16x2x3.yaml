@@ -1,11 +1,13 @@
-nodes: 8
-tasks_per_node: 8
+nodes: 1  # 8 nodes -> 1 node
+tasks_per_node: 1
 tag: ssv2-16x2x3
 eval_name: video_classification_frozen
 resume_checkpoint: false
 data:
-  dataset_train: /your_path_to_ssv2_train_csv_file_index.csv
-  dataset_val: /your_path_to_ssv2_val_csv_file_index.csv
+  dataset_train: /datasets/sthv2/local_train.csv
+  dataset_val: /datasets/sthv2/local_val.csv
+  # dataset_train: /mnt/jaden/datasets/sthv2/azure_train.csv
+  # dataset_val: /mnt/jaden/datasets/sthv2/azure_val.csv
   dataset_type: VideoDataset
   num_classes: 174
   frames_per_clip: 16
@@ -14,14 +16,14 @@ data:
   frame_step: 4
 optimization:
   attend_across_segments: true
-  num_epochs: 20
+  num_epochs: 20  # (20 → 25)
   resolution: 224
-  batch_size: 4
+  batch_size: 8  # (4 → 8)    256 (8 nodes * 8 GPUs * 4 batch) -> 64 (1 node * 8 GPUs * 8 batch)
   weight_decay: 0.01
-  lr: 0.001
-  start_lr: 0.001
+  lr: 0.00025 # 0.001 * (64/256) = 0.00025
+  start_lr: 0.00025 # 0.001 * (64/256) = 0.00025
   final_lr: 0.0
-  warmup: 0.
+  warmup: 0. # (0. → 0.1)
   use_bfloat16: true
 pretrain:
   model_name: vit_large
@@ -34,6 +36,7 @@ pretrain:
   tight_silu: false
   use_sdpa: true
   patch_size: 16
-  folder: /your_absolute_file_path_to_directory_where_pretrained_models_are_contained/
-  checkpoint: jepa-latest.pth.tar  # name of pretrained model file inside folder
+  # folder: /mnt/jaden/igor_encoder/checkpoint/
+  folder: /storage/igor_encoder/checkpoint/
+  checkpoint: vitl16.pth.tar  # name of pretrained model file inside folder
   write_tag: jepa

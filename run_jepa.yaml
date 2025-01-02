@@ -1,0 +1,102 @@
+description: JEPA env for IGOR-encoder 
+
+target:
+  service: sing
+  # target name, e.g., msroctovc
+  name: msrresrchvc #msrresrchvc # [msroctovc, msrresrchvc, msrresrchlab, msroctobasicvc]
+  # workspace name, e.g., [RushAML, gcrllm2ws, gcrllama2ws]
+  workspace_name: RushAML
+
+environment:
+  image: amlt-sing/acpt-2.3.1-py3.10-cuda12.1 
+  setup:
+  - sudo apt-get update
+
+
+code:
+  local_dir: $CONFIG_DIR
+  ignore:
+  - models/__pycach__/
+
+storage:
+  jaden:
+    storage_account_name: rushaml2996082614
+    container_name: jaden
+    mount_dir: /mnt/jaden 
+
+jobs:
+- name: igor_4G16B_1try
+  # sku: 80G1-A100 # - msrresrchvc
+
+  # sku: 40G8-A100-IB-NvLink # 40G8-A100-IB-NvLink 40G8-A100-NvLink - msroctobasicvc [standard] / msroctovc [premium, standard]    ~ phase2_long
+  # sku: 40G8-A100-NvLink # 40G8-A100-IB-NvLink 40G8-A100-NvLink - msroctobasicvc [standard] / msroctovc [premium, standard]    ~ phase2_long
+
+  sku: 80G4-A100-NvLink # 80G2-A100         - msroctobasicvc [standard] / msrresrchvc [premium, standard] ~ phase1_lr1-4G
+
+  # sku: 32G8-V100 # 32G8-V100 32G8-V100-IB - msrresrchlab [premium, standard]
+  # sku: 32G2-V100 # 32G8-V100-IB # 32G2-V100 32G4-V100 - msrresrchlab
+
+  # sku: 80G8-H100-IB-NvLink # 80G8-H100-IB-NvLink 80G8-H100-NvLink - msrresrchvc [premium, standard] Quick!  -
+
+
+  process_count_per_node: 1
+  mpi: true
+  execution_mode: Basic
+  priority: High
+  sla_tier: premium #premium #standard
+  identity: managed
+  submit_args:
+    env:
+      AMLT_DIRSYNC_MOVE: "true"
+      _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/1584df91-d540-4cd3-a9ca-24ff3dc95ba7/resourcegroups/Identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/RL-job-Identity
+  command:
+  - echo "<<<<<  checking first status  >>>>>"
+  # - export $$(grep -v '^#' .env | xargs)
+  # - nvidia-smi
+  # - pip list
+
+  - echo "<<<<<  start igor encoder env setup!  >>>>>"
+  # - pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+
+  - pip install --pre -U xformers==0.0.26.post1
+  - pip install wandb hydra-core==1.1.1 h5py rich transformers==4.36.0 av pandas hurry.filesize 
+  - pip install einops jsonlines tabulate timm lightning accelerate
+  - pip install rlds[tensorflow] tensorflow-datasets
+  - pip install tensorflow_graphics
+  - sudo apt-get update
+  - sudo apt-get install git tmux nano -y
+  - sudo apt-get install ffmpeg libsm6 libxext6 -y
+  - pip install decord ffmpeg
+  - pip install opencv-python kornia
+
+  - echo "<<<<<  start JEPA env setup!  >>>>>"
+  - python setup.py install
+  - echo "<<<<<  finish env setup!  >>>>>"  
+
+
+#######################################  
+  # - GPUS=8 bash run_distributed.sh configs/evals/vitl16_ssv2.yaml azure jepa_8G_8B_2-5e4
+  # - GPUS=4 bash run_distributed.sh configs/evals/vitl16_ssv2.yaml azure jepa_4G_16B_2-5e4
+  # - GPUS=8 bash run_distributed.sh configs/evals/vitl16_ssv2.yaml azure jepa_8G_8B_2-5e4_20eNoWarmUp # => 앞으로 이걸 stadard로!
+####################################### config file refactoring & sota reproducing.
+  # - GPUS=4 bash run_distributed.sh configs/evals/vitl16_ssv2_4G16B.yaml azure sota_4G_50e
+  # - GPUS=8 bash run_distributed.sh configs/evals/vitl16_ssv2_8G8B.yaml azure jepa_8G_8B_2-5e4_20eNoWarmUp_NoOverlap
+####################################### from this No-warmup is defafult. /  make cfg-optins
+  - GPUS=4 bash run_distributed.sh configs/evals/vitl16_ssv2_4G16B.yaml azure jepa_4G_30e --cfg-options optimization.num_epochs=30
+
+####################################### IGOR 
+  # - GPUS=4 bash run_distributed.sh configs/evals/igor16_ssv2_4G.yaml azure igor_4G16B
+  # - GPUS=4 bash run_distributed.sh configs/evals/igor16_ssv2_4G.yaml azure igor_4G16B_unfreeze
+
+  # - GPUS=8 bash run_distributed.sh configs/evals/igor16_ssv2_8G.yaml azure TEST
+
+  - python build_train.py
+
+
+# python -m evals.main_auto --config configs/evals/vitl16_ssv2_4G16B.yaml --env local --tag test
+# python -m evals.main_auto --config configs/evals/igor16_ssv2_4G.yaml --env local --tag test
+  
+# amlt project create igor_mmaction rushaml2996082614 jaden igor_encoder
+# amlt workspace add RushAML --resource-group SouthCentralUS --subscription 1584df91-d540-4cd3-a9ca-24ff3dc95ba7
+
+
