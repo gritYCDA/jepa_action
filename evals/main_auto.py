@@ -184,7 +184,7 @@ Upgrade --cfg-options
 python -m evals.main_auto --config configs/evals/vitl16_ssv2.yaml --env local --tag my_tag --cfg-options optimization.lr=0.0003 optimization.batch_size=16 pretrain.freeze_all=true
 
 <Multi GPU>
-# GPUS=8 ./run_distributed.sh configs/evals/vitl16_ssv2.yaml azure TEST --cfg-options optimization.lr=0.0003 optimization.batch_size=16 pretrain.freeze_all=true
+GPUS=8 ./run_distributed.sh configs/evals/vitl16_ssv2.yaml azure TEST --cfg-options optimization.lr=0.0003 optimization.batch_size=16 pretrain.freeze_all=true
 
 주요 기능:
 

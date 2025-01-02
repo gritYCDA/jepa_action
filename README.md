@@ -12,6 +12,77 @@ Adrien Bardes, Quentin Garrido, Jean Ponce, Xinlei Chen, Michael Rabbat, Yann Le
 
 V-JEPA models are trained by passively watching video pixels from the VideoMix2M dataset, and produce versatile visual representations that perform well on downstream video and image tasks, without adaption of the model’s parameters; e.g., using a frozen backbone and only a light-weight task-specific attentive probe.
 
+
+# Major Updates 2025.01.02
+
+## Integration with torchrun-based Execution Environment
+
+The multi-GPU and single-GPU configurations have been unified into `main_auto.py` and migrated to a torchrun-based execution method. This change provides a more stable and efficient training environment.
+
+## Execution Methods
+
+### Single GPU Execution
+```bash
+python -m evals.main_auto --config configs/evals/vitl16_ssv2.yaml --env local --tag my_tag --cfg-options optimization.lr=0.0003 optimization.batch_size=16 pretrain.freeze_all=true
+```
+
+### Multi-GPU Execution
+```bash
+GPUS=8 ./run_distributed.sh configs/evals/vitl16_ssv2.yaml azure my_tag --cfg-options optimization.lr=0.0003 optimization.batch_size=16 pretrain.freeze_all=true
+```
+
+## Configuration Modification Features (cfg-options)
+
+You can modify configuration values directly from the command line using the `--cfg-options` flag. This allows for rapid experimentation without directly editing the configuration files.
+
+### Supported Modification Formats
+
+1. **Single Value Modification**
+   - Format: `key=value`
+   - Example: `model.type=resnet50`
+
+2. **List Value Modification**
+   - Bracket format: `key=[value1,value2,value3]`
+   - Comma-separated format: `key=value1,value2,value3`
+   - Example: `data.augmentation=[random_crop,flip]`
+
+3. **Nested Configuration Modification**
+   - Format: `parent.child=value`
+   - Example: `optimization.lr=0.001`
+
+4. **Multiple Configuration Modifications**
+   - Format: Multiple key=value pairs separated by spaces
+   - Example: `optimization.lr=0.001 model.type=resnet50 training.epochs=100`
+
+### Usage Examples
+
+```bash
+# Modify learning rate and batch size
+--cfg-options optimization.lr=0.0003 optimization.batch_size=16
+
+# Set pretrained model weight freeze and data augmentation
+--cfg-options pretrain.freeze_all=true data.augmentation=[random_crop,color_jitter]
+```
+
+## Important Notes
+
+- When modifying list values, use commas without spaces for separation.
+- When modifying nested configurations, specify the exact hierarchy structure.
+- Floating-point values also support scientific notation (e.g., 1e-3).
+- Configuration modifications through command line take precedence over the values in configuration files.
+
+## Examples of Combined Usage
+
+```bash
+# Training with custom learning rate and frozen weights
+python -m evals.main_auto --config configs/evals/vitl16_ssv2.yaml --env local --tag exp1 --cfg-options optimization.lr=0.0003 pretrain.freeze_all=true
+
+# Distributed training with modified batch size and augmentation
+GPUS=8 ./run_distributed.sh configs/evals/vitl16_ssv2.yaml azure exp2 --cfg-options optimization.batch_size=32 data.augmentation=[random_crop,color_jitter,flip]
+```
+
+These modifications allow for flexible configuration adjustments directly from the command line interface, eliminating the need to edit configuration files manually.
+
 ## Method
 V-JEPA pretraining is based solely on an unsupervised feature prediction objective, and does not utilize pretrained image encoders, text, negative examples, human annotations, or pixel-level reconstruction.
 
